@@ -37,7 +37,7 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
 
     def _index_prometheus(self, manifests: list[dict]) -> None:
         for i, m in enumerate(manifests):
-            spec = m.get("spec", {})
+            spec = m.get("spec") or {}
             if i == 0:
                 self._prometheus_spec = {
                     "image": spec.get("image", ""),
@@ -58,13 +58,13 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
         if not manifests:
             return ProviderResult()
 
-        exclude = ctx.config.get("exclude", [])
+        exclude = ctx.config.get("exclude") or []
         scrape_jobs: list[dict] = []
         ca_mounts: list[str] = []
 
         for m in manifests:
-            name = m.get("metadata", {}).get("name", "?")
-            spec = m.get("spec", {})
+            name = (m.get("metadata") or {}).get("name", "?")
+            spec = m.get("spec") or {}
 
             match_labels = (spec.get("selector") or {}).get("matchLabels") or {}
             if not match_labels:
@@ -92,8 +92,10 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
             if self._is_excluded(compose_name, exclude):
                 continue
 
-            endpoints = spec.get("endpoints", [])
+            endpoints = spec.get("endpoints") or []
             for idx, ep in enumerate(endpoints):
+                if not ep:
+                    continue
                 job = self._build_scrape_job(
                     name, idx, len(endpoints), ep, target_svc, compose_name, ctx
                 )
@@ -123,7 +125,7 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
                     "namespace": ns,
                     "selector": {},
                     "type": "ClusterIP",
-                    "ports": k8s_svc.get("ports", []),
+                    "ports": k8s_svc.get("ports") or [],
                 }
 
         return ProviderResult(services={"prometheus": service})
@@ -183,8 +185,8 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
         """Find the K8s Service that exposes Prometheus (port 9090)."""
         for svc_name, svc_info in ctx.services_by_selector.items():
             if "prometheus" in svc_name and svc_name != "prometheus":
-                ports = svc_info.get("ports", [])
-                if any(p.get("port") == 9090 or p.get("targetPort") == 9090
+                ports = svc_info.get("ports") or []
+                if any(p and (p.get("port") == 9090 or p.get("targetPort") == 9090)
                        for p in ports):
                     return svc_info
         return None
@@ -199,7 +201,7 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
         that's what ctx.services_by_selector indexes.
         """
         for svc_info in ctx.services_by_selector.values():
-            selector = svc_info.get("selector", {})
+            selector = svc_info.get("selector") or {}
             if not selector:
                 continue
             if all(selector.get(k) == v for k, v in match_labels.items()):
@@ -237,8 +239,8 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
         if not port_ref:
             if svc_info is None:
                 return None
-            ports = svc_info.get("ports", [])
-            if ports:
+            ports = svc_info.get("ports") or []
+            if ports and ports[0]:
                 return ports[0].get("targetPort", ports[0].get("port"))
             return None
 
@@ -252,8 +254,8 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
         if svc_info is None:
             return None
 
-        for sp in svc_info.get("ports", []):
-            if sp.get("name") == port_ref:
+        for sp in (svc_info.get("ports") or []):
+            if sp and sp.get("name") == port_ref:
                 tp = sp.get("targetPort", sp.get("port"))
                 # targetPort can itself be a name (references container port name)
                 # — only return if numeric
@@ -293,7 +295,7 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
 
         # Use FQDN target if namespace is available (compose DNS resolves
         # it via network aliases — matches cert SANs for HTTPS)
-        svc_info_for_ns = ctx.services_by_selector.get(compose_name, {})
+        svc_info_for_ns = ctx.services_by_selector.get(compose_name) or {}
         ns = svc_info_for_ns.get("namespace", "")
         if svc_info is not None:
             ns = svc_info.get("namespace", "") or ns
