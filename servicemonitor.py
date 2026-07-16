@@ -7,13 +7,12 @@ image/version/retention; ServiceMonitors provide scrape targets.
 
 from __future__ import annotations
 
-import fnmatch
 import os
 import sys
 
 import yaml
 
-from dekube import ProviderResult, Provider  # pylint: disable=import-error  # h2c resolves at runtime
+from dekube import ProviderResult, Provider, is_excluded  # pylint: disable=import-error  # h2c resolves at runtime
 
 
 class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-methods  # contract: one class, one method
@@ -89,7 +88,7 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
                 target_svc = None  # no Service — port resolution limited
 
             # Skip excluded services
-            if self._is_excluded(compose_name, exclude):
+            if is_excluded(compose_name, exclude):
                 continue
 
             endpoints = spec.get("endpoints") or []
@@ -357,11 +356,6 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
             tls_config["server_name"] = server_name
 
         return tls_config, ca_mounts
-
-    @staticmethod
-    def _is_excluded(name: str, exclude: list[str]) -> bool:
-        """Check if a service name matches any exclude pattern."""
-        return any(fnmatch.fnmatch(name, pat) for pat in exclude)
 
     # -- YAML generation -------------------------------------------------
 
