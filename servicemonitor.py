@@ -12,7 +12,9 @@ import sys
 
 import yaml
 
-from dekube import ProviderResult, Provider, is_excluded  # pylint: disable=import-error  # h2c resolves at runtime
+from dekube import (  # pylint: disable=import-error  # h2c resolves at runtime
+    ProviderResult, Provider, is_excluded, write_configmap_files, write_secret_files,
+)
 
 
 class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-methods  # contract: one class, one method
@@ -62,7 +64,9 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
         ca_mounts: list[str] = []
 
         for m in manifests:
-            name = (m.get("metadata") or {}).get("name", "?")
+            meta = m.get("metadata") or {}
+            name = meta.get("name", "?")
+            sm_ns = meta.get("namespace") or "default"
             spec = m.get("spec") or {}
 
             match_labels = (spec.get("selector") or {}).get("matchLabels") or {}
@@ -96,7 +100,7 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
                 if not ep:
                     continue
                 job = self._build_scrape_job(
-                    name, idx, len(endpoints), ep, target_svc, compose_name, ctx
+                    name, sm_ns, idx, ep, target_svc, compose_name, ctx
                 )
                 if job is None:
                     continue
@@ -270,8 +274,8 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
     def _build_scrape_job(
         self,
         sm_name: str,
+        sm_ns: str,
         ep_idx: int,
-        ep_count: int,
         ep: dict,
         svc_info: dict | None,
         compose_name: str,
@@ -287,20 +291,26 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
             )
             return None
 
-        job_name = sm_name if ep_count == 1 else f"{sm_name}-{ep_idx}"
+        # Matches the Prometheus Operator's own scrape-config naming
+        # (serviceMonitor/<namespace>/<name>/<endpoint-index>, see promcfg.go
+        # generateServiceMonitorConfig) — the namespace makes it unique across
+        # namespaces, which a bare ServiceMonitor name doesn't guarantee.
+        job_name = f"serviceMonitor/{sm_ns}/{sm_name}/{ep_idx}"
         scheme = ep.get("scheme", "http")
         path = ep.get("path", "/metrics")
         interval = ep.get("interval", "30s")
 
-        # Use FQDN target if namespace is available (compose DNS resolves
-        # it via network aliases — matches cert SANs for HTTPS)
-        svc_info_for_ns = ctx.services_by_selector.get(compose_name) or {}
-        ns = svc_info_for_ns.get("namespace", "")
+        # Target host: the K8s Service's own name (+ namespace, FQDN), NOT the
+        # compose service name — _build_network_aliases (dekube-engine) only
+        # registers DNS aliases under the K8s name, so aliasing to compose_name
+        # here would resolve to nothing when alias_map renames the service.
         if svc_info is not None:
-            ns = svc_info.get("namespace", "") or ns
-        if ns:
-            target_host = f"{compose_name}.{ns}.svc.cluster.local"
+            dns_name = svc_info.get("name") or compose_name
+            ns = svc_info.get("namespace", "")
+            target_host = f"{dns_name}.{ns}.svc.cluster.local" if ns else dns_name
         else:
+            # No K8s Service in the manifests (name-based fallback) — no
+            # aliases were registered, so the raw compose name is all we have.
             target_host = compose_name
 
         job: dict = {
@@ -325,30 +335,52 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
 
     @staticmethod
     def _build_tls_config(ep: dict, sm_name: str, ctx) -> tuple[dict, list[str]]:
-        """Build Prometheus TLS config and CA mounts from a ServiceMonitor endpoint."""
+        """Build Prometheus TLS config and CA mounts from a ServiceMonitor endpoint.
+
+        tlsConfig fields per the Prometheus Operator API (SafeTLSConfig,
+        tls_types.go): ``insecureSkipVerify`` (bool) and ``ca``, a
+        SecretOrConfigMap — mutually exclusive ``configMap``/``secret``
+        sub-fields, each a name+key selector.
+        """
         tls_cfg = ep.get("tlsConfig") or {}
         tls_config: dict = {}
         ca_mounts: list[str] = []
 
-        # CA certificate
-        ca_ref = (tls_cfg.get("ca") or {}).get("configMap") or {}
-        cm_name = ca_ref.get("name", "")
-        cm_key = ca_ref.get("key", "ca-certificates.crt")
-        if "/" in cm_key or ".." in cm_key:
-            ctx.warnings.append(
-                f"ServiceMonitor '{sm_name}': CA key '{cm_key}' contains path separators — skipped")
-            return {}, []
-        if cm_name and cm_name in ctx.configmaps:
-            container_path = f"/etc/prometheus/ca/{cm_name}/{cm_key}"
-            tls_config["ca_file"] = container_path
-            ca_mounts.append(
-                f"./configmaps/{cm_name}/{cm_key}:{container_path}:ro"
-            )
-        elif cm_name:
-            ctx.warnings.append(
-                f"ServiceMonitor '{sm_name}': CA configmap '{cm_name}' "
-                f"not found — TLS job generated without ca_file"
-            )
+        if tls_cfg.get("insecureSkipVerify"):
+            tls_config["insecure_skip_verify"] = True
+
+        ca_ref = tls_cfg.get("ca") or {}
+        cm_ref = ca_ref.get("configMap") or {}
+        secret_ref = ca_ref.get("secret") or {}
+
+        if cm_ref.get("name"):
+            cm_name = cm_ref["name"]
+            cm_key = cm_ref.get("key") or "ca-certificates.crt"
+            if "/" in cm_key or ".." in cm_key:
+                ctx.warnings.append(
+                    f"ServiceMonitor '{sm_name}': CA key '{cm_key}' contains path separators — skipped")
+            else:
+                # write_configmap_files actually emits the file to output_dir
+                # (ctx.configmaps only indexes the manifest in memory — a raw
+                # ./configmaps/<name>/<key> mount without this call points at
+                # a file that was never written).
+                rel_dir = write_configmap_files(cm_name, ctx, items=[{"key": cm_key}])
+                if rel_dir:
+                    container_path = f"/etc/prometheus/ca/{cm_name}/{cm_key}"
+                    tls_config["ca_file"] = container_path
+                    ca_mounts.append(f"{rel_dir}/{cm_key}:{container_path}:ro")
+        elif secret_ref.get("name"):
+            sec_name = secret_ref["name"]
+            sec_key = secret_ref.get("key") or "ca.crt"
+            if "/" in sec_key or ".." in sec_key:
+                ctx.warnings.append(
+                    f"ServiceMonitor '{sm_name}': CA key '{sec_key}' contains path separators — skipped")
+            else:
+                rel_dir = write_secret_files(sec_name, ctx, items=[{"key": sec_key}])
+                if rel_dir:
+                    container_path = f"/etc/prometheus/ca/{sec_name}/{sec_key}"
+                    tls_config["ca_file"] = container_path
+                    ca_mounts.append(f"{rel_dir}/{sec_key}:{container_path}:ro")
 
         # Server name for TLS verification
         server_name = tls_cfg.get("serverName", "")

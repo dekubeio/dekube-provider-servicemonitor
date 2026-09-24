@@ -26,8 +26,9 @@ Replaces the Prometheus Operator's ServiceMonitor reconciliation with a static P
 - Resolves `spec.selector.matchLabels` against K8s Service selectors to find the target service
 - Maps the K8s Service name to compose service name via `ctx.alias_map`
 - Resolves named ports through the K8s Service `spec.ports[]` to get the target port
-- Supports multiple endpoints per ServiceMonitor (suffixed job names)
-- For `scheme: https` endpoints, mounts CA bundle ConfigMaps from trust-manager under `/etc/prometheus/ca/`
+- Supports multiple endpoints per ServiceMonitor (`job_name` is `serviceMonitor/<namespace>/<name>/<index>`, matching the Prometheus Operator's own convention, so it stays unique across namespaces)
+- Scrape targets use the K8s Service's own DNS name (`<name>.<namespace>.svc.cluster.local`), not the compose service name — that's what compose's network aliases are registered under
+- For `scheme: https` endpoints, mounts a CA cert from `tlsConfig.ca.configMap` or `tlsConfig.ca.secret` (trust-manager bundles, or any other ConfigMap/Secret) under `/etc/prometheus/ca/`, and honors `tlsConfig.insecureSkipVerify`
 - Generates `configmaps/prometheus-scrape-config/prometheus.yml` with all resolved scrape jobs
 
 ## Priority
