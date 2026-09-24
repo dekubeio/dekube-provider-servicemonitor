@@ -76,8 +76,20 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
                 )
                 continue
 
+            # namespaceSelector (monitoring.coreos.com/v1 NamespaceSelector,
+            # prometheus-operator types.go): any=true searches every namespace;
+            # matchNames restricts to those; absent/empty defaults to the
+            # ServiceMonitor's own namespace ("services are discovered in the
+            # same namespace as the ServiceMonitor object", servicemonitor_types.go:118).
+            ns_sel = spec.get("namespaceSelector") or {}
+            if ns_sel.get("any"):
+                allowed_ns = None
+            else:
+                match_names = ns_sel.get("matchNames") or []
+                allowed_ns = set(match_names) if match_names else {sm_ns}
+
             # Resolve target: try K8s Service first, then name-based fallback
-            target_svc = self._find_service(match_labels, ctx)
+            target_svc = self._find_service(match_labels, allowed_ns, ctx)
             if target_svc is not None:
                 svc_name = target_svc["name"]
                 compose_name = ctx.alias_map.get(svc_name, svc_name)
@@ -195,15 +207,20 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
         return None
 
     @staticmethod
-    def _find_service(match_labels: dict, ctx) -> dict | None:
+    def _find_service(match_labels: dict, allowed_ns: set | None, ctx) -> dict | None:
         """Find K8s Service whose spec.selector matches the given labels.
 
         ServiceMonitor selector.matchLabels targets Service metadata.labels,
         which in standard Helm charts are identical to the Service's
         spec.selector (pod labels). We match against spec.selector since
         that's what ctx.services_by_selector indexes.
+
+        allowed_ns is None for namespaceSelector.any (search everywhere), or
+        a set of namespace names to restrict to (see caller).
         """
         for svc_info in ctx.services_by_selector.values():
+            if allowed_ns is not None and svc_info.get("namespace", "") not in allowed_ns:
+                continue
             selector = svc_info.get("selector") or {}
             if not selector:
                 continue
