@@ -64,60 +64,9 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
         ca_mounts: list[str] = []
 
         for m in manifests:
-            meta = m.get("metadata") or {}
-            name = meta.get("name", "?")
-            sm_ns = meta.get("namespace") or "default"
-            spec = m.get("spec") or {}
-
-            match_labels = (spec.get("selector") or {}).get("matchLabels") or {}
-            if not match_labels:
-                ctx.warnings.append(
-                    f"ServiceMonitor '{name}': no selector.matchLabels, skipping"
-                )
-                continue
-
-            # namespaceSelector (monitoring.coreos.com/v1 NamespaceSelector,
-            # prometheus-operator types.go): any=true searches every namespace;
-            # matchNames restricts to those; absent/empty defaults to the
-            # ServiceMonitor's own namespace ("services are discovered in the
-            # same namespace as the ServiceMonitor object", servicemonitor_types.go:118).
-            ns_sel = spec.get("namespaceSelector") or {}
-            if ns_sel.get("any"):
-                allowed_ns = None
-            else:
-                match_names = ns_sel.get("matchNames") or []
-                allowed_ns = set(match_names) if match_names else {sm_ns}
-
-            # Resolve target: try K8s Service first, then name-based fallback
-            target_svc = self._find_service(match_labels, allowed_ns, ctx)
-            if target_svc is not None:
-                svc_name = target_svc["name"]
-                compose_name = ctx.alias_map.get(svc_name, svc_name)
-            else:
-                compose_name = self._fallback_by_name(name, match_labels, ctx)
-                if compose_name is None:
-                    ctx.warnings.append(
-                        f"ServiceMonitor '{name}': no K8s Service matches "
-                        f"labels {match_labels}, skipping"
-                    )
-                    continue
-                target_svc = None  # no Service — port resolution limited
-
-            # Skip excluded services
-            if is_excluded(compose_name, exclude):
-                continue
-
-            endpoints = spec.get("endpoints") or []
-            for idx, ep in enumerate(endpoints):
-                if not ep:
-                    continue
-                job = self._build_scrape_job(
-                    name, sm_ns, idx, ep, target_svc, compose_name, ctx
-                )
-                if job is None:
-                    continue
-                scrape_jobs.append(job["job"])
-                ca_mounts.extend(job.get("ca_mounts", []))
+            jobs, mounts = self._process_one_servicemonitor(m, exclude, ctx)
+            scrape_jobs.extend(jobs)
+            ca_mounts.extend(mounts)
 
         if not scrape_jobs:
             ctx.warnings.append("No resolvable ServiceMonitors found")
@@ -125,25 +74,116 @@ class ServiceMonitorProvider(Provider):  # pylint: disable=too-few-public-method
 
         self._write_scrape_config(scrape_jobs, ctx)
         service = self._build_prometheus_service(ca_mounts, ctx)
-
-        # Register Prometheus in services_by_selector so _build_network_aliases
-        # generates FQDN aliases. The K8s Service name differs from the compose
-        # service name — register both + alias_map entry.
-        k8s_svc = self._find_prometheus_k8s_service(ctx)
-        if k8s_svc:
-            k8s_name = k8s_svc["name"]
-            ns = k8s_svc.get("namespace", "")
-            ctx.alias_map[k8s_name] = "prometheus"
-            if "prometheus" not in ctx.services_by_selector:
-                ctx.services_by_selector["prometheus"] = {
-                    "name": "prometheus",
-                    "namespace": ns,
-                    "selector": {},
-                    "type": "ClusterIP",
-                    "ports": k8s_svc.get("ports") or [],
-                }
+        self._register_prometheus_aliases(ctx)
 
         return ProviderResult(services={"prometheus": service})
+
+    def _process_one_servicemonitor(
+        self, m: dict, exclude: list, ctx
+    ) -> tuple[list[dict], list[str]]:
+        """Resolve one ServiceMonitor manifest into scrape jobs + CA mounts.
+
+        Returns ([], []) when the ServiceMonitor is skipped (no selector, no
+        matching Service, or the resolved target is excluded) — the caller
+        just extends its accumulators with whatever comes back.
+        """
+        meta = m.get("metadata") or {}
+        name = meta.get("name", "?")
+        sm_ns = meta.get("namespace") or "default"
+        spec = m.get("spec") or {}
+
+        match_labels = (spec.get("selector") or {}).get("matchLabels") or {}
+        if not match_labels:
+            ctx.warnings.append(
+                f"ServiceMonitor '{name}': no selector.matchLabels, skipping"
+            )
+            return [], []
+
+        allowed_ns = self._resolve_allowed_namespaces(spec, sm_ns)
+
+        target_svc, compose_name = self._resolve_target(name, match_labels, allowed_ns, ctx)
+        if compose_name is None:
+            return [], []
+
+        # Skip excluded services
+        if is_excluded(compose_name, exclude):
+            return [], []
+
+        scrape_jobs: list[dict] = []
+        ca_mounts: list[str] = []
+        endpoints = spec.get("endpoints") or []
+        for idx, ep in enumerate(endpoints):
+            if not ep:
+                continue
+            job = self._build_scrape_job(
+                name, sm_ns, idx, ep, target_svc, compose_name, ctx
+            )
+            if job is None:
+                continue
+            scrape_jobs.append(job["job"])
+            ca_mounts.extend(job.get("ca_mounts", []))
+
+        return scrape_jobs, ca_mounts
+
+    @staticmethod
+    def _resolve_allowed_namespaces(spec: dict, sm_ns: str) -> set | None:
+        """Resolve namespaceSelector into an allowed-namespace set (None = any).
+
+        namespaceSelector (monitoring.coreos.com/v1 NamespaceSelector,
+        prometheus-operator types.go): any=true searches every namespace;
+        matchNames restricts to those; absent/empty defaults to the
+        ServiceMonitor's own namespace ("services are discovered in the
+        same namespace as the ServiceMonitor object", servicemonitor_types.go:118).
+        """
+        ns_sel = spec.get("namespaceSelector") or {}
+        if ns_sel.get("any"):
+            return None
+        match_names = ns_sel.get("matchNames") or []
+        return set(match_names) if match_names else {sm_ns}
+
+    def _resolve_target(
+        self, name: str, match_labels: dict, allowed_ns: set | None, ctx
+    ) -> tuple[dict | None, str | None]:
+        """Resolve a ServiceMonitor's target: K8s Service first, then name fallback.
+
+        Returns (target_svc, compose_name); compose_name is None when the
+        ServiceMonitor matches no Service and no name-based fallback either
+        (a warning has already been appended in that case).
+        """
+        target_svc = self._find_service(match_labels, allowed_ns, ctx)
+        if target_svc is not None:
+            svc_name = target_svc["name"]
+            compose_name = ctx.alias_map.get(svc_name, svc_name)
+            return target_svc, compose_name
+
+        compose_name = self._fallback_by_name(name, match_labels, ctx)
+        if compose_name is None:
+            ctx.warnings.append(
+                f"ServiceMonitor '{name}': no K8s Service matches "
+                f"labels {match_labels}, skipping"
+            )
+            return None, None
+        return None, compose_name  # no Service — port resolution limited
+
+    def _register_prometheus_aliases(self, ctx) -> None:
+        """Register Prometheus in services_by_selector so _build_network_aliases
+        generates FQDN aliases. The K8s Service name differs from the compose
+        service name — register both + alias_map entry.
+        """
+        k8s_svc = self._find_prometheus_k8s_service(ctx)
+        if not k8s_svc:
+            return
+        k8s_name = k8s_svc["name"]
+        ns = k8s_svc.get("namespace", "")
+        ctx.alias_map[k8s_name] = "prometheus"
+        if "prometheus" not in ctx.services_by_selector:
+            ctx.services_by_selector["prometheus"] = {
+                "name": "prometheus",
+                "namespace": ns,
+                "selector": {},
+                "type": "ClusterIP",
+                "ports": k8s_svc.get("ports") or [],
+            }
 
     def _write_scrape_config(self, scrape_jobs: list[dict], ctx) -> None:
         """Write prometheus.yml from resolved scrape jobs."""
