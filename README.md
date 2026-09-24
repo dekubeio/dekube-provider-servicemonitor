@@ -23,7 +23,7 @@ Replaces the Prometheus Operator's ServiceMonitor reconciliation with a static P
 - If no Prometheus CR exists, defaults to `prom/prometheus:latest` with 15d retention
 
 **ServiceMonitor CR:**
-- Resolves `spec.selector.matchLabels` against K8s Service selectors to find the target service
+- Resolves `spec.selector.matchLabels` against K8s Service selectors to find the target service, scoped by `spec.namespaceSelector` (`any: true` searches every namespace, `matchNames` restricts to those, and — matching upstream's own default — an absent/empty selector restricts to the ServiceMonitor's own namespace)
 - Maps the K8s Service name to compose service name via `ctx.alias_map`
 - Resolves named ports through the K8s Service `spec.ports[]` to get the target port
 - Supports multiple endpoints per ServiceMonitor (`job_name` is `serviceMonitor/<namespace>/<name>/<index>`, matching the Prometheus Operator's own convention, so it stays unique across namespaces)
