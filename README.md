@@ -75,16 +75,16 @@ python3 helmfile2compose.py \
 
 ## Code quality
 
-*Last updated: 2026-02-23*
+*Last updated: 2026-09-24*
 
 | Metric | Value |
 |--------|-------|
-| Pylint | 9.73/10 |
+| Pylint | 9.65/10 |
 | Pyflakes | clean |
-| Radon MI | 40.78 (A) |
-| Radon avg CC | 5.3 (B) |
+| Radon MI | 34.96 (A) |
+| Radon avg CC | 6.6 (B) |
 
-Worst CC: `_resolve_port` (13, C), `_process_servicemonitors` (12, C).
+Worst CC: `_resolve_port` (17, C), `_build_tls_config` (17, C), `_process_one_servicemonitor` (13, C). No function rated D or worse — `_process_servicemonitors` (was D/25) was split into per-manifest, target-resolution and alias helpers, byte-identical output.
 
 The `E0401: Unable to import 'dekube'` is expected — extensions import from dekube-engine at runtime, not at lint time.
 
